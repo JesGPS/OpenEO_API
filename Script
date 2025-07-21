@@ -1,0 +1,88 @@
+"""
+Script to connect to the openEO VITO back-end, extract Sentinel-2 FCOVER data for selected agricultural field boundaries,
+and export a time series of median FCOVER values for buffered geometries. The script is based on the information available in https://open-eo.github.io/openeo-python-client/basics.html
+
+Requirements:
+- An openEO account (with EGI authentication)
+- Local shapefile of fields (projected in EPSG:4326)
+- Python libraries: openeo, geopandas, shapely, pandas, matplotlib
+
+Author: [Your Name]
+Date: [YYYY-MM-DD]
+"""
+
+# Import necessary libraries
+import openeo
+import os
+import json
+import shapely.geometry
+import pandas as pd
+from openeo.rest.conversions import timeseries_json_to_pandas
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from shapely.geometry import shape, GeometryCollection
+
+# Connect to the openEO VITO back-end and authenticate
+connection = openeo.connect("http://openeo.vito.be")
+connection.authenticate_oidc(provider_id="egi")
+connection.describe_account()
+
+# Load and buffer shapefile of fields
+shapefile_path = r"C:\Users\your_username\fields.shp"  # Replace with your local path
+geojson_path = shapefile_path.replace(".shp", ".geojson")
+
+# Read shapefile using GeoPandas
+gdf = gpd.read_file(shapefile_path)
+
+# Optional: apply inward buffer (~20 meters, CRS must be EPSG:4326)
+buffer_distance = -0.0001
+gdf["buffered_geom"] = gdf.geometry.buffer(buffer_distance)
+
+# Plot original vs buffered geometries
+fig, ax = plt.subplots()
+gdf.geometry.plot(ax=ax, facecolor="none", edgecolor="blue", label="Original")
+gdf["buffered_geom"].plot(ax=ax, facecolor="none", edgecolor="red", linestyle="--", label="Buffered")
+plt.legend()
+plt.title("Original (blue) vs Inward Buffered (red dashed) Field Boundaries")
+plt.show()
+
+# Read geojson and create buffered geometries
+with open(geojson_path) as f:
+    features = json.load(f)["features"]
+
+buffered_geometries = []
+for feature in features:
+    geom = shape(feature["geometry"])
+    buffered = geom.buffer(buffer_distance)
+    if not buffered.is_empty:
+        buffered_geometries.append(buffered)
+
+# Create GeometryCollection for spatial aggregation
+fields = GeometryCollection(buffered_geometries)
+
+# Define the date range for the time series
+dates = ("2016-01-01", "2023-12-31")
+
+# Load index data from the TERRASCOPE collection. Learn more about collections and bands: https://hub.openeo.org/
+cube = connection.load_collection(
+    collection_id="TERRASCOPE_S2_FCOVER_V2", 
+    bands=["FCOVER_10M"],
+    temporal_extent=dates,
+    max_cloud_cover=10
+)
+
+# Aggregate spatially using damped geometries and define statistical metrics for location
+timeseries = cube.aggregate_spatial(geometries=fields, reducer="median")
+
+# Download the time series as JSON
+timeseries.download("timeseries.json", format="JSON")
+
+# Convert JSON to Pandas DataFrame and scale values
+with open("timeseries.json") as f:
+    df = timeseries_json_to_pandas(json.load(f)).dropna()
+
+df.index = pd.to_datetime(df.index)
+df = df * 0.005  # Apply scale factor
+df.to_csv("timeseries_FCOVER.csv", header=["FCOVER"])
+
+print("CSV file saved as 'timeseries_FCOVER.csv'")
